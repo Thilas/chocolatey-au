@@ -21,7 +21,7 @@
     https://github.com/chocolatey/choco/wiki/CreatePackages#testing-your-package
 #>
 function Test-Package {
-    [CmdletBinding(DefaultParameterSetName="Local")]
+    [CmdletBinding(DefaultParameterSetName="Vagrant")]
     param(
         # If file, path to the .nupkg or .nuspec file for the package.
         # If directory, latest .nupkg or .nuspec file wil be looked in it.
@@ -38,12 +38,16 @@ function Test-Package {
         # Package parameters
         [string] $Parameters,
 
+        # Invokes the package test locally
+        [Parameter(Mandatory, ParameterSetName="Local")]
+        [switch] $Local,
+
         # Path to chocolatey-test-environment: https://github.com/majkinetor/chocolatey-test-environment
         [Parameter(ParameterSetName="Vagrant")]
         [string] $Vagrant = $env:au_Vagrant,
 
-        [Parameter(ParameterSetName="Vagrant")]
         # Open new shell window
+        [Parameter(ParameterSetName="Vagrant")]
         [switch] $VagrantOpen,
 
         # Do not remove existing packages from vagrant package directory
@@ -51,7 +55,7 @@ function Test-Package {
         [switch] $VagrantNoClear,
 
         # Invokes the package test within Windows Sandbox, if available
-        [Parameter(ParameterSetName="Sandbox")]
+        [Parameter(Mandatory, ParameterSetName="Sandbox")]
         [switch] $Sandbox,
 
         # If set, does not destroy the Windows Sandbox instance or files.
@@ -73,8 +77,8 @@ function Test-Package {
     }
 
     if (!$Nu) {
-        $Nu = Get-Item $dir/*.nupkg | Sort-Object -Property CreationTime -Descending | Select-Object -First 1
-        if (!$Nu) { $Nu = Get-Item $dir/*.nuspec }
+        $Nu = Get-Item "$dir/*.nupkg" | Sort-Object -Property CreationTime -Descending | Select-Object -First 1
+        if (!$Nu) { $Nu = Get-Item "$dir/*.nuspec" | Sort-Object -Property CreationTime -Descending | Select-Object -First 1 }
         if (!$Nu) { throw "Can't find nupkg or nuspec file in the directory" }
     }
 
@@ -85,10 +89,17 @@ function Test-Package {
         $Nu = Get-Item ([System.IO.Path]::Combine($Nu.DirectoryName, '*.nupkg')) | Sort-Object -Property CreationTime -Descending | Select-Object -First 1
     } elseif ($Nu.Extension -ne '.nupkg') { throw "File is not nupkg or nuspec file" }
 
-    # At this point Nu is nupkg file
+    # At this point $Nu is nupkg file
 
-    $package_name    = $Nu.Name -replace '(\.\d+)+(-[^-]+)?\.nupkg$'
-    $package_version = ($Nu.BaseName -replace $package_name).Substring(1)
+    $tempFolder = Join-Path $env:TEMP "$(New-Guid)"
+    New-Item -Path $tempFolder -ItemType Directory | Out-Null
+    Copy-Item -Path $Nu -Destination $tempFolder
+    # Use chocolatey to determine package name and version
+    $package_info = choco search -r --source="'$tempFolder'"
+    Remove-Item -Path $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
+    if ("$package_info" -notmatch '^(?<name>.+)\|(?<version>[^|]+)$') { throw "Invalid package info to test: $Nu" }
+    $package_name    = $Matches.name
+    $package_version = $Matches.version
 
     Write-Host "`nPackage info"
     Write-Host "  Path:".PadRight(15)      $Nu
@@ -98,12 +109,12 @@ function Test-Package {
 
     if ($Sandbox) {
         if (-not (Get-Command WindowsSandbox -ErrorAction SilentlyContinue)) {
-            Write-Error "Windows Sandbox is not available. Please try Local or Vagrant methods." -ErrorAction Stop
+            throw "Windows Sandbox is not available. Please try Local or Vagrant methods."
         }
         Write-Host "`nTesting package using Windows Sandbox"
 
         $SandboxTempFolder = Join-Path $env:TEMP "$(New-Guid)"
-        $null = New-Item -Path $SandboxTempFolder\ChocoTestingSandbox.wsb -Force -Value @"
+        $null = New-Item -Path "$SandboxTempFolder\ChocoTestingSandbox.wsb" -Force -Value @"
             <Configuration>
                 <Networking>Enable</Networking>
                 <MappedFolders>
@@ -114,66 +125,79 @@ function Test-Package {
                     </MappedFolder>
                 </MappedFolders>
                 <LogonCommand>
-                    <Command>C:\packages\Test-Package.cmd</Command>
+                    <Command>powershell -ExecutionPolicy Bypass -File C:\packages\Test-Package.ps1</Command>
                 </LogonCommand>
             </Configuration>
 "@
-
-        $TestCommand = @(
+        Set-Content -Path "$SandboxTempFolder\Test-Package.ps1" -Value @(
             'Start-Transcript -Path c:\packages\log.txt'
+            # Install chocolatey
+            '[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072'
+            "iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))"
             '$Results = @{}'
             if ($Install) {
-                "choco install -y $package_name --version $package_version --no-progress --source `"'C:\packages\;https://community.chocolatey.org/api/v2/'`"$(if ($Parameters) {[string]::format(' --packageParameters="''{0}''"', $Parameters)}) | Write-Host"
+                'Write-Host "`nTesting package install"'
+                "choco install -y $package_name --version $package_version --no-progress --source `"'C:\packages\;https://community.chocolatey.org/api/v2/'`" --packageParameters `"'$Parameters'`" | Write-Host"
                 '$Results.InstallExitCode = $LASTEXITCODE'
             }
             if ($Uninstall) {
+                'Write-Host "`nTesting package uninstall"'
                 "choco uninstall -y $package_name | Write-Host"
                 '$Results.UninstallExitCode = $LASTEXITCODE'
             }
             'Stop-Transcript'
-            'Copy-Item C:\ProgramData\chocolatey\logs\* -Destination C:\packages\'
+            if ($NoDestroy) { 'Copy-Item C:\ProgramData\chocolatey\logs\* -Destination C:\packages\' }
             '$Results | Export-Clixml -Path C:\packages\results.clixml'
-        ) -join '; '
-        $null = New-Item -Path $SandboxTempFolder\Test-Package.cmd -Value @"
-            @"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -InputFormat None -ExecutionPolicy Bypass -Command "iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))" && SET "PATH=%PATH%;%ALLUSERSPROFILE%\chocolatey\bin"
-            @"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -InputFormat None -ExecutionPolicy Bypass -Command "$($TestCommand)"
-"@
+        )
         Copy-Item -Path $Nu -Destination $SandboxTempFolder
 
         try {
-            & WindowsSandbox "$SandboxTempFolder\ChocoTestingSandbox.wsb"
+            $ServerProcess = Start-Process WindowsSandbox -ArgumentList "$SandboxTempFolder\ChocoTestingSandbox.wsb" -PassThru
+            $Client = $null
 
             $Timer = [System.Diagnostics.Stopwatch]::StartNew()
             $BytesShown = 0  # Nothing shown yet
-            while ($Timer.IsRunning -and $Timer.Elapsed.TotalMinutes -lt $Timeout) {
-                if (Test-Path $SandboxTempFolder\log.txt) {
-                    $Log = Get-Content $SandboxTempFolder\log.txt -Raw
+            while ($Timer.Elapsed.TotalMinutes -lt $Timeout) {
+                if (!$Client) {
+                    $Client = Get-Process WindowsSandboxClient -ErrorAction SilentlyContinue `
+                    | Where-Object { $_.Parent.Id -eq $ServerProcess.Id } `
+                    | ForEach-Object { [pscustomobject] @{ Process = $_; Minimized = $false } } `
+                    | Select-Object -First 1
+                    $code = '[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);'
+                    $win32 = Add-Type -Name Win32 -MemberDefinition $code -PassThru
+                }
+                if ($Client -and !$Client.Minimized) {
+                    # Minimize Windows Sandbox client as soon as possible
+                    $Client.Minimized = $win32::ShowWindowAsync($Client.Process.MainWindowHandle, 6) # SW_MINIMIZE
+                }
+                if (Test-Path "$SandboxTempFolder\log.txt") {
+                    $Log = Get-Content "$SandboxTempFolder\log.txt" -Raw
                     -join $Log[$BytesShown..$Log.Length] | Write-Host -NoNewLine
                     $BytesShown = $Log.Length
                 }
 
-                if (Test-Path $SandboxTempFolder\results.clixml) {
-                    $Timer.Stop()
+                if (Test-Path "$SandboxTempFolder\results.clixml") {
+                    break
                 }
 
                 Start-Sleep -Milliseconds 500
             }
-        } finally {
-            if (Test-Path $SandboxTempFolder\results.clixml) {
-                $Results = Import-Clixml $SandboxTempFolder\results.clixml
 
-                if ($Install) {
-                    if ($Results.InstallExitCode -ne 0) { throw "choco install failed with $($Results.InstallExitCode)"}
+            if (Test-Path "$SandboxTempFolder\results.clixml") {
+                $Results = Import-Clixml "$SandboxTempFolder\results.clixml"
+
+                if ($Install -and $Results.InstallExitCode -ne 0) {
+                    throw "choco install failed with $($Results.InstallExitCode)"
                 }
-                if ($Uninstall) {
-                    if ($Results.UninstallExitCode -ne 0) { throw "choco install failed with $($Results.UninstallExitCode)"}
+                if ($Uninstall -and $Results.UninstallExitCode -ne 0) {
+                    throw "choco uninstall failed with $($Results.UninstallExitCode)"
                 }
             } else {
-                Write-Error "Test failed after $($Timeout) minutes without a results file."
+                throw "Test failed after $($Timeout) minutes without a results file."
             }
-
+        } finally {
             if (-not $NoDestroy) {
-                Get-Process WindowsSandboxClient | Stop-Process
+                if ($Client.Process) { $Client.Process | Stop-Process -PassThru -ErrorAction SilentlyContinue | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue }
 
                 $Tries = 0
                 while ($Tries++ -lt 4 -and (Test-Path $SandboxTempFolder)) {
