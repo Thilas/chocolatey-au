@@ -315,15 +315,31 @@ function Update-Package {
         $date_format = 'yyyyMMdd'
         $d = (get-date).ToString($date_format)
         $nuspecVersion = [AUVersion] $Latest.NuspecVersion
-        $v = $nuspecVersion.Version
-        $rev = $v.Revision.ToString()
-        try { $revdate = [DateTime]::ParseExact($rev, $date_format,[System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None) } catch {}
-        if (($rev -ne -1) -and !$revdate) { return }
-
-        $build = if ($v.Build -eq -1) {0} else {$v.Build}
-        $v = [version] ('{0}.{1}.{2}.{3}' -f $v.Major, $v.Minor, $build, $d)
-        $package.RemoteVersion = $nuspecVersion.WithVersion($v).ToString()
-        $Latest.Version = $package.RemoteVersion -as $Latest.Version.GetType()
+        if ($nuspecVersion.Prerelease) {
+            $pre = if ($nuspecVersion.Prerelease -match '^(.+)-(\d{8})$') {
+                try {
+                    [DateTime]::ParseExact($Matches[2], $date_format, [System.Globalization.CultureInfo]::InvariantCulture, 'None') | Out-Null
+                    $Matches[1]
+                } catch {
+                    $nuspecVersion.Prerelease
+                }
+            } else {
+                $nuspecVersion.Prerelease
+            }
+            
+            $package.RemoteVersion = $nuspecVersion.WithPrerelease("$pre-$d").ToString()
+            $Latest.Version = $package.RemoteVersion -as $Latest.Version.GetType()
+        } else {
+            $v = $nuspecVersion.Version
+            $rev = $v.Revision.ToString()
+            try { $revdate = [DateTime]::ParseExact($rev, $date_format,[System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None) } catch {}
+            if (($rev -ne -1) -and !$revdate) { return }
+            
+            $build = if ($v.Build -eq -1) {0} else {$v.Build}
+            $v = [version] ('{0}.{1}.{2}.{3}' -f $v.Major, $v.Minor, $build, $d)
+            $package.RemoteVersion = $nuspecVersion.WithVersion($v).ToString()
+            $Latest.Version = $package.RemoteVersion -as $Latest.Version.GetType()
+        }
     }
 
     function set_latest( [HashTable] $latest, [string] $version, $stream ) {
