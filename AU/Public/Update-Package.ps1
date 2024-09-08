@@ -100,7 +100,10 @@ function Update-Package {
         [switch] $WhatIf, 
 
         #Disable automatic update of nuspec description from README.md files with first 2 lines skipped.
-        [switch] $NoReadme
+        [switch] $NoReadme,
+
+        #Disable automatic update of release notes.
+        [switch] $NoReleaseNotes
     )
 
     function check_urls() {
@@ -285,6 +288,7 @@ function Update-Package {
         try {
             if (Test-Path Function:\au_BeforeUpdate) { 'Running au_BeforeUpdate' | result; au_BeforeUpdate $package | result }
             if (!$NoReadme -and (Test-Path (Join-Path $package.Path 'README.md'))) { Set-DescriptionFromReadme $package -SkipFirst 2 | result }        
+            if (!$NoReleaseNotes -and $null -ne $Latest.ReleaseNotes) { Set-ReleaseNotes $package -ReleaseNotes $Latest.ReleaseNotes | result }
             update_files
             if (Test-Path Function:\au_AfterUpdate) { 'Running au_AfterUpdate' | result; au_AfterUpdate $package | result }
         
